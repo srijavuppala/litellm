@@ -1,15 +1,15 @@
 import json
-from typing import Any, List, Tuple
-
 import os
+from typing import Any, AsyncIterator, Iterator, List, Optional, Tuple, Union
 
 import httpx
 
 from litellm.exceptions import AuthenticationError
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.llms.openai.chat.gpt_transformation import OpenAIChatCompletionStreamingHandler
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolCallChunk
-from litellm.types.utils import ModelResponse
+from litellm.types.utils import ModelResponse, ModelResponseStream
 
 from ..authenticator import Authenticator
 from ..common_utils import (
@@ -110,6 +110,18 @@ class GithubCopilotConfig(OpenAIConfig):
             validated_headers["Copilot-Vision-Request"] = "true"
 
         return validated_headers
+
+    def get_model_response_iterator(
+        self,
+        streaming_response: Union[Iterator[str], AsyncIterator[str], ModelResponse],
+        sync_stream: bool,
+        json_mode: Optional[bool] = False,
+    ) -> Any:
+        return GithubCopilotChatCompletionStreamingHandler(
+            streaming_response=streaming_response,
+            sync_stream=sync_stream,
+            json_mode=json_mode,
+        )
 
     def get_supported_openai_params(self, model: str) -> list:
         """
@@ -320,3 +332,35 @@ class GithubCopilotConfig(OpenAIConfig):
             api_key=api_key,
             json_mode=json_mode,
         )
+
+
+class GithubCopilotChatCompletionStreamingHandler(OpenAIChatCompletionStreamingHandler):
+    """
+    Streaming handler for GitHub Copilot's chat completions endpoint.
+
+    GitHub Copilot streams extended-thinking data as:
+      - delta.reasoning_text  (per-chunk reasoning summary)
+      - delta.reasoning_opaque (final opaque signature chunk)
+
+    The base OpenAI handler has no knowledge of these fields, so they are silently
+    dropped. This handler remaps reasoning_text → reasoning_content (LiteLLM's
+    standard reasoning field) and surfaces reasoning_opaque in provider_specific_fields.
+    """
+
+    def chunk_parser(self, chunk: dict) -> ModelResponseStream:
+        choices = chunk.get("choices", [])
+        for choice in choices:
+            delta = choice.get("delta", {})
+
+            # Map GitHub Copilot's reasoning_text to LiteLLM's reasoning_content
+            if "reasoning_text" in delta:
+                delta["reasoning_content"] = delta.pop("reasoning_text")
+
+            # Surface reasoning_opaque in provider_specific_fields so callers
+            # can reconstruct the opaque token for cache-read turns
+            if "reasoning_opaque" in delta:
+                opaque = delta.pop("reasoning_opaque")
+                psf = delta.setdefault("provider_specific_fields", {})
+                psf["reasoning_opaque"] = opaque
+
+        return super().chunk_parser(chunk)

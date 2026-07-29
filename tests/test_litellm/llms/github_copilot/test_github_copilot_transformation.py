@@ -21,7 +21,10 @@ import litellm.llms.github_copilot.chat.transformation
 from litellm import Choices, Message, ModelResponse, Usage, acompletion, completion
 from litellm.exceptions import AuthenticationError
 from litellm.llms.github_copilot.authenticator import Authenticator
-from litellm.llms.github_copilot.chat.transformation import GithubCopilotConfig
+from litellm.llms.github_copilot.chat.transformation import (
+    GithubCopilotChatCompletionStreamingHandler,
+    GithubCopilotConfig,
+)
 from litellm.llms.github_copilot.common_utils import (
     APIKeyExpiredError,
     GetAccessTokenError,
@@ -982,3 +985,71 @@ def test_openai_handler_repairs_github_copilot_empty_choices(
     assert result.choices[0].message.content == "Hi there"
     assert result.choices[0].finish_reason == "stop"
     mock_request.assert_called_once()
+
+
+def test_github_copilot_streaming_reasoning_text_mapped_to_reasoning_content():
+    """
+    reasoning_text in delta must be remapped to reasoning_content.
+    GitHub Copilot streams delta.reasoning_text but LiteLLM consumers expect
+    delta.reasoning_content — the base OpenAI handler has no knowledge of this field
+    and would silently drop it without the override in
+    GithubCopilotChatCompletionStreamingHandler.
+    """
+    handler = GithubCopilotChatCompletionStreamingHandler.__new__(
+        GithubCopilotChatCompletionStreamingHandler
+    )
+    chunk = {
+        "id": "test-id",
+        "model": "claude-sonnet-5",
+        "created": 1,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "reasoning_text": "Let me think step by step."},
+                "finish_reason": None,
+            }
+        ],
+    }
+    result = handler.chunk_parser(chunk)
+
+    delta = result.choices[0].delta
+    assert delta.reasoning_content == "Let me think step by step.", (
+        "delta.reasoning_text must be remapped to delta.reasoning_content"
+    )
+    assert not hasattr(delta, "reasoning_text") or delta.reasoning_text is None, (
+        "delta.reasoning_text must not survive after remapping"
+    )
+
+
+def test_github_copilot_streaming_reasoning_opaque_in_provider_specific_fields():
+    """
+    reasoning_opaque in delta must be surfaced in provider_specific_fields.
+    GitHub Copilot emits a final delta.reasoning_opaque chunk containing the
+    opaque signature needed for cache-read turns. Without the handler override it
+    is silently dropped; with it the value is available at
+    delta.provider_specific_fields['reasoning_opaque'].
+    """
+    handler = GithubCopilotChatCompletionStreamingHandler.__new__(
+        GithubCopilotChatCompletionStreamingHandler
+    )
+    chunk = {
+        "id": "test-id",
+        "model": "claude-sonnet-5",
+        "created": 1,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning_opaque": "opaque-signature-abc123"},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    result = handler.chunk_parser(chunk)
+
+    delta = result.choices[0].delta
+    assert delta.provider_specific_fields is not None, (
+        "provider_specific_fields must be set when reasoning_opaque is present"
+    )
+    assert delta.provider_specific_fields.get("reasoning_opaque") == "opaque-signature-abc123", (
+        "reasoning_opaque must be stored in delta.provider_specific_fields"
+    )
