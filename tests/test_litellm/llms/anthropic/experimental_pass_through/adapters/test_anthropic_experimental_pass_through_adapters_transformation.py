@@ -67,8 +67,6 @@ def test_translate_streaming_openai_chunk_to_anthropic_content_block():
         choices=choices
     )
 
-    print(content_block_start)
-
     assert block_type == "tool_use"
     assert content_block_start == {
         "type": "tool_use",
@@ -622,9 +620,6 @@ def test_translate_streaming_openai_chunk_to_anthropic_with_partial_json():
         choices=choices
     )
 
-    print("Type of content:", type_of_content)
-    print("Content block delta:", content_block_delta)
-
     assert type_of_content == "input_json_delta"
     assert content_block_delta["type"] == "input_json_delta"
     assert content_block_delta["partial_json"] == ': "San '
@@ -704,7 +699,7 @@ def test_translate_streaming_openai_chunk_to_anthropic_with_thinking():
     assert content_block_delta["thinking"] == "I need to summar"
 
 
-def test_translate_streaming_openai_chunk_to_anthropic_with_thinking():
+def test_translate_streaming_openai_chunk_to_anthropic_with_signature():
     choices = [
         StreamingChoices(
             finish_reason=None,
@@ -2230,8 +2225,6 @@ def test_translate_openai_response_to_anthropic_input_tokens_no_cache():
     """
     Regression test: input_tokens should equal prompt_tokens when there are no cached tokens.
     """
-    from litellm.types.utils import PromptTokensDetailsWrapper
-
     # Create OpenAI format response without cached tokens
     usage = Usage(
         prompt_tokens=100,
@@ -3208,3 +3201,56 @@ def test_translate_anthropic_tools_to_openai_preserves_parameters_type():
     params = new_tools[0]["function"]["parameters"]
     assert params["type"] == "object"
     assert new_tools[0]["type"] == "function"
+
+
+def test_translate_anthropic_tools_to_openai_does_not_mutate_input_schema():
+    """Regression for #34510: translate_anthropic_tools_to_openai must not
+    mutate the caller's input_schema dict in place via the extra-kwargs loop.
+
+    Computer tools carry vendor-specific keys (display_width_px, etc.) outside
+    input_schema; those keys must appear in the translated parameters but must
+    never leak back into the original input_schema on the source tool.
+    """
+    import copy
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    tool = {
+        "name": "computer",
+        "type": "computer_20241022",
+        "input_schema": {"type": "object", "properties": {"action": {"type": "string"}}},
+        "display_width_px": 1024,
+        "display_height_px": 768,
+    }
+    original_schema = copy.deepcopy(tool["input_schema"])
+
+    adapter.translate_anthropic_tools_to_openai(tools=[tool], model="claude-3-5-sonnet")
+
+    assert tool["input_schema"] == original_schema, (
+        "translate_anthropic_tools_to_openai must not mutate the caller's input_schema; "
+        f"expected {original_schema}, got {tool['input_schema']}"
+    )
+
+
+def test_translate_anthropic_tools_to_openai_second_translation_is_idempotent():
+    """Regression for #34510: translating the same tool list twice (as happens
+    in the Anthropic-passthrough guardrail pre-call path) must produce the
+    same parameters on the second pass as on the first.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    tools = [
+        {
+            "name": "computer",
+            "type": "computer_20241022",
+            "input_schema": {"type": "object", "properties": {"action": {"type": "string"}}},
+            "display_width_px": 1024,
+            "display_height_px": 768,
+        }
+    ]
+
+    first, _ = adapter.translate_anthropic_tools_to_openai(tools=tools, model="claude-3-5-sonnet")
+    second, _ = adapter.translate_anthropic_tools_to_openai(tools=tools, model="claude-3-5-sonnet")
+
+    assert first[0]["function"]["parameters"] == second[0]["function"]["parameters"], (
+        "Parameters differ between first and second translation — "
+        "input_schema was mutated on the first pass"
+    )
