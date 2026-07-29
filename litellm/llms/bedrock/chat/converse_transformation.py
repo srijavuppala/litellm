@@ -1288,12 +1288,9 @@ class AmazonConverseConfig(BaseConfig):
         additional_request_params = {k: v for k, v in inference_params.items() if k not in total_supported_params}
         inference_params = {k: v for k, v in inference_params.items() if k in total_supported_params}
 
-        # Handle parallel_tool_calls configuration
-        parallel_tool_use_config = additional_request_params.pop("_parallel_tool_use_config", None)
-        if parallel_tool_use_config is not None and bedrock_converse_supports_parallel_tool_use_config(model):
-            additional_request_params = self._merge_parallel_tool_use_config(
-                additional_request_params, parallel_tool_use_config
-            )
+        # _parallel_tool_use_config must only be merged into additionalModelRequestFields
+        # when tools are actually present; keep it under its key and let
+        # _transform_request_helper decide after it knows whether bedrock_tools is non-empty.
 
         additional_request_params.pop("parallel_tool_calls", None)
 
@@ -1573,14 +1570,26 @@ class AmazonConverseConfig(BaseConfig):
                     bedrock_tools.append(ToolBlock(cachePoint=cache_point))
                     break
 
+        # Always pop tool_choice so it never leaks into inferenceConfig; only
+        # attach it to toolConfig when tools are actually present.
+        tool_choice_values: ToolChoiceValuesBlock = inference_params.pop("tool_choice", None)
+
+        # Pop parallel-tool-use config unconditionally; only merge it when tools
+        # are present — sending it without toolConfig causes a Bedrock 400.
+        parallel_tool_use_config = additional_request_params.pop("_parallel_tool_use_config", None)
+
         bedrock_tool_config: Optional[ToolConfigBlock] = None
         if len(bedrock_tools) > 0:
-            tool_choice_values: ToolChoiceValuesBlock = inference_params.pop("tool_choice", None)
-            bedrock_tool_config = ToolConfigBlock(
-                tools=bedrock_tools,
-            )
+            bedrock_tool_config = ToolConfigBlock(tools=bedrock_tools)
             if tool_choice_values is not None:
                 bedrock_tool_config["toolChoice"] = tool_choice_values
+            if (
+                parallel_tool_use_config is not None
+                and bedrock_converse_supports_parallel_tool_use_config(model)
+            ):
+                additional_request_params = self._merge_parallel_tool_use_config(
+                    additional_request_params, parallel_tool_use_config
+                )
 
         data: CommonRequestObject = {
             "inferenceConfig": self._transform_inference_params(inference_params=inference_params),

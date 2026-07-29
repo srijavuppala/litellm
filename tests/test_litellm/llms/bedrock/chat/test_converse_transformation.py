@@ -1,10 +1,8 @@
-import asyncio
 import json
 import os
 import sys
 
 import pytest
-from fastapi.testclient import TestClient
 
 sys.path.insert(
     0, os.path.abspath("../../../../..")
@@ -12,7 +10,7 @@ sys.path.insert(
 from unittest.mock import MagicMock, patch
 
 import litellm
-from litellm import ModelResponse, RateLimitError, completion
+from litellm import ModelResponse
 from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
 from litellm.types.llms.bedrock import ConverseTokenUsageBlock
 
@@ -249,7 +247,6 @@ def test_transform_tool_call_with_cache_control():
     assert len(result["toolConfig"]["tools"]) == 2
 
     function_out_msg = result["toolConfig"]["tools"][0]
-    print(function_out_msg)
     assert function_out_msg["toolSpec"]["name"] == "get_location"
     assert function_out_msg["toolSpec"]["description"] == "Get the user's location"
     assert (
@@ -562,7 +559,6 @@ def test_get_supported_openai_params_bedrock_converse():
     please update this test to read `bedrock_converse` models from the model cost map.
     """
     for model in litellm.BEDROCK_CONVERSE_MODELS:
-        print(f"Testing model: {model}")
         config = AmazonConverseConfig()
         supported_params_without_prefix = config.get_supported_openai_params(
             model=model
@@ -575,7 +571,6 @@ def test_get_supported_openai_params_bedrock_converse():
         assert set(supported_params_without_prefix) == set(
             supported_params_with_prefix
         ), f"Supported params mismatch for model: {model}. Without prefix: {supported_params_without_prefix}, With prefix: {supported_params_with_prefix}"
-        print(f"✅ Passed for model: {model}")
 
 
 def test_transform_request_helper_includes_anthropic_beta_and_tools():
@@ -673,13 +668,8 @@ def test_parallel_tool_calls_config_dropped_for_ttl_only_model(
 
 def test_transform_response_with_computer_use_tool():
     """Test response transformation with computer use tool call."""
-    import httpx
 
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
-    from litellm.types.llms.bedrock import (
-        ConverseResponseBlock,
-        ConverseTokenUsageBlock,
-    )
     from litellm.types.utils import ModelResponse
 
     # Simulate a Bedrock Converse response with a computer-use tool call
@@ -768,13 +758,8 @@ def test_transform_response_with_computer_use_tool():
 
 def test_transform_response_with_bash_tool():
     """Test response transformation with bash tool call."""
-    import httpx
 
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
-    from litellm.types.llms.bedrock import (
-        ConverseResponseBlock,
-        ConverseTokenUsageBlock,
-    )
     from litellm.types.utils import ModelResponse
 
     # Simulate a Bedrock Converse response with a bash tool call
@@ -5862,3 +5847,118 @@ def test_adaptive_thinking_dropped_when_max_tokens_too_small_converse():
     )
 
     assert "thinking" not in optional_params
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #34420 — toolless requests must not emit toolConfig,
+# tool_choice, or the parallel-tool-use config block.
+# ---------------------------------------------------------------------------
+
+
+def test_toolless_request_does_not_emit_tool_config_or_tool_choice():
+    """Bedrock Converse 400s when tool_choice appears in a request with no tools.
+    AmazonConverseConfig.transform_request must strip tool_choice and must not
+    attach a toolConfig block when the request carries no tools.
+    """
+    config = AmazonConverseConfig()
+    model = "bedrock/us.anthropic.claude-sonnet-4-5"
+
+    optional_params = config.map_openai_params(
+        non_default_params={"tool_choice": "auto", "max_tokens": 256},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    request_data = config.transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+
+    assert "toolConfig" not in request_data, (
+        "toolConfig must not appear in a toolless request"
+    )
+    inference_cfg = request_data.get("inferenceConfig", {})
+    assert "toolChoice" not in inference_cfg, (
+        "tool_choice must not leak into inferenceConfig on a toolless request"
+    )
+
+
+def test_toolless_request_with_parallel_tool_calls_false_does_not_400():
+    """Agent frameworks (e.g. n8n) pass parallel_tool_calls=False on every turn,
+    including turns with no tools. Before the fix this injected a
+    disable_parallel_tool_use block into additionalModelRequestFields even when
+    no toolConfig was present, causing Bedrock to return 400.
+    """
+    config = AmazonConverseConfig()
+    model = "bedrock/us.anthropic.claude-sonnet-4-5"
+
+    optional_params = config.map_openai_params(
+        non_default_params={"parallel_tool_calls": False, "max_tokens": 256},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    request_data = config.transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+
+    assert "toolConfig" not in request_data, (
+        "toolConfig must not appear in a toolless request"
+    )
+    additional = request_data.get("additionalModelRequestFields", {})
+    assert "tool_choice" not in additional, (
+        "parallel_tool_calls-derived tool_choice must not appear in additionalModelRequestFields "
+        "without an accompanying toolConfig"
+    )
+
+
+def test_request_with_tools_still_gets_tool_choice():
+    """Regression guard: when tools ARE present, tool_choice must still be
+    forwarded into toolConfig correctly.
+    """
+    config = AmazonConverseConfig()
+    model = "bedrock/us.anthropic.claude-sonnet-4-5"
+
+    optional_params = config.map_openai_params(
+        non_default_params={
+            "tool_choice": "auto",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    },
+                }
+            ],
+            "max_tokens": 256,
+        },
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    request_data = config.transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "What's the weather?"}],
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+
+    assert "toolConfig" in request_data, "toolConfig must be present when tools are provided"
+    assert "toolChoice" in request_data["toolConfig"], "toolChoice must be in toolConfig when tool_choice is set"
