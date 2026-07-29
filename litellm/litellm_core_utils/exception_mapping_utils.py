@@ -1120,20 +1120,6 @@ def _map_vertex_exception(
             llm_provider=custom_llm_provider,
             litellm_debug_info=extra_information,
         )
-    elif "403" in error_str:
-        raise BadRequestError(
-            message=f"{custom_llm_provider.capitalize()}Exception BadRequestError - {error_str}",
-            model=model,
-            llm_provider=custom_llm_provider,
-            response=httpx.Response(
-                status_code=403,
-                request=httpx.Request(
-                    method="POST",
-                    url=" https://cloud.google.com/vertex-ai/",
-                ),
-            ),
-            litellm_debug_info=extra_information,
-        )
     elif (
         "The response was blocked." in error_str
         or "Output blocked by content filtering policy" in error_str  # anthropic on vertex ai
@@ -1155,6 +1141,7 @@ def _map_vertex_exception(
         "429 Quota exceeded" in error_str
         or "Quota exceeded for" in error_str
         or "Resource exhausted" in error_str
+        or "RESOURCE_EXHAUSTED" in error_str
         or "IndexError: list index out of range" in error_str
         or "429 Unable to submit request because the service is temporarily out of capacity." in error_str
     ):
@@ -1192,6 +1179,20 @@ def _map_vertex_exception(
                     url=" https://cloud.google.com/vertex-ai/",
                 ),
             ),
+        )
+    elif "403" in error_str:
+        raise BadRequestError(
+            message=f"{custom_llm_provider.capitalize()}Exception BadRequestError - {error_str}",
+            model=model,
+            llm_provider=custom_llm_provider,
+            response=httpx.Response(
+                status_code=403,
+                request=httpx.Request(
+                    method="POST",
+                    url=" https://cloud.google.com/vertex-ai/",
+                ),
+            ),
+            litellm_debug_info=extra_information,
         )
     elif "500 Internal Server Error" in error_str or "The model is overloaded." in error_str:
         raise litellm.InternalServerError(

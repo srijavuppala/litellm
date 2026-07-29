@@ -680,3 +680,66 @@ def test_azure_404_with_invalid_request_error_type_maps_to_not_found():
 
     assert excinfo.value.status_code == 404
     assert "Response with id 'resp_abc' not found." in excinfo.value.message
+
+
+# ---------------------------------------------------------------------------
+# Tests for the Gemini/Vertex 429 → "403" substring collision fix
+# ---------------------------------------------------------------------------
+# Google AI Studio retry-delay strings (e.g. "Please retry in 18.403470473s.")
+# contain the substring "403".  Before the fix the unanchored `"403" in error_str`
+# branch evaluated *before* every 429/quota branch, causing a transient
+# RateLimitError to map to BadRequestError and bypass Router retries.
+
+
+def _make_resource_exhausted_body(delay: str) -> str:
+    return (
+        '{"error": {"code": 429, "message": "You exceeded your current quota. '
+        "Please retry in " + delay + 's.", "status": "RESOURCE_EXHAUSTED"}}'
+    )
+
+
+@pytest.mark.parametrize(
+    "retry_delay",
+    [
+        "18.403470473",  # contains "403" — was misclassified before fix
+        "18.9",  # clean decimal — always worked
+        "0.403",  # starts with "403" substring
+    ],
+)
+def test_gemini_429_resource_exhausted_maps_to_rate_limit_regardless_of_retry_delay(
+    retry_delay,
+):
+    """HTTP 429 + RESOURCE_EXHAUSTED status must always raise RateLimitError,
+    even when the retry-delay string happens to contain the substring "403".
+    """
+    from litellm.llms.base_llm.chat.transformation import BaseLLMException
+
+    body = _make_resource_exhausted_body(retry_delay)
+    original_exception = BaseLLMException(status_code=429, message=body)
+
+    with pytest.raises(litellm.RateLimitError):
+        exception_type(
+            model="gemini/gemini-3.1-flash-lite",
+            original_exception=original_exception,
+            custom_llm_provider="gemini",
+        )
+
+
+def test_gemini_genuine_403_maps_to_bad_request():
+    """A genuine HTTP 403 (permission denied) must still raise BadRequestError
+    (or PermissionDeniedError) via the status-code branch — not get swallowed
+    by something else after moving the "403" text branch.
+    """
+    from litellm.llms.base_llm.chat.transformation import BaseLLMException
+
+    original_exception = BaseLLMException(
+        status_code=403,
+        message='{"error": {"code": 403, "message": "Request had insufficient authentication scopes.", "status": "PERMISSION_DENIED"}}',
+    )
+
+    with pytest.raises((litellm.BadRequestError, litellm.PermissionDeniedError)):
+        exception_type(
+            model="gemini/gemini-3.1-flash-lite",
+            original_exception=original_exception,
+            custom_llm_provider="gemini",
+        )
