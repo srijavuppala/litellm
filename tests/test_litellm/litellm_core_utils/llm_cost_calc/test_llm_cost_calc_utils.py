@@ -2399,3 +2399,39 @@ def test_generic_cost_per_token_gemini_35_flash_lite():
     )
     assert prompt_cost == pytest.approx(0.0003)
     assert completion_cost == pytest.approx(0.00125)
+
+
+@pytest.mark.parametrize(
+    "service_tier, expected_cache_write_rate",
+    [
+        (None, 6.25e-6),
+        ("priority", 1.25e-5),
+        ("flex", 3.125e-6),
+    ],
+)
+def test_service_tier_cache_creation_rates_are_registered(
+    service_tier, expected_cache_write_rate, _local_model_cost_map
+):
+    """Regression for #33772: ModelInfo dropped cache_creation_input_token_cost_flex
+    and _priority, so `_get_cost_per_unit` fell back to the standard cache-write rate
+    for every service tier. gpt-5.6 publishes all three, so priority under-billed 2x
+    and flex over-billed 2x."""
+    model_info = litellm.get_model_info("gpt-5.6")
+    assert model_info.get("cache_creation_input_token_cost_priority") == 1.25e-5
+    assert model_info.get("cache_creation_input_token_cost_flex") == 3.125e-6
+
+    usage = Usage(
+        prompt_tokens=1_000,
+        completion_tokens=0,
+        total_tokens=1_000,
+        prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=0, cache_write_tokens=1_000),
+    )
+
+    prompt_cost, _ = generic_cost_per_token(
+        model="gpt-5.6",
+        usage=usage,
+        custom_llm_provider="openai",
+        service_tier=service_tier,
+    )
+
+    assert prompt_cost == pytest.approx(1_000 * expected_cache_write_rate, rel=1e-9)
